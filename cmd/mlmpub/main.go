@@ -54,6 +54,7 @@ type options struct {
 	subsWvttLangs    string
 	subsStppLangs    string
 	version          bool
+	relay            bool // Enable relay mode to accept external publishers
 }
 
 func parseOptions(fs *flag.FlagSet, args []string) (*options, error) {
@@ -75,6 +76,7 @@ func parseOptions(fs *flag.FlagSet, args []string) (*options, error) {
 	fs.StringVar(&opts.subsWvttLangs, "subswvtt", "sv", "Comma-separated WVTT subtitle languages (e.g. 'en,sv')")
 	fs.StringVar(&opts.subsStppLangs, "subsstpp", "en", "Comma-separated STPP subtitle languages (e.g. 'en,sv')")
 	fs.BoolVar(&opts.version, "version", false, fmt.Sprintf("Get %s version", appName))
+	fs.BoolVar(&opts.relay, "relay", true, "Enable relay mode to accept external publishers (default: true)")
 	err := fs.Parse(args[1:])
 	return &opts, err
 }
@@ -157,6 +159,11 @@ func runServer(opts *options) error {
 		catalog:         catalog,
 		logfh:           logfh,
 		fingerprintPort: opts.fingerprintPort,
+		relayMode:       opts.relay,
+	}
+
+	if opts.relay {
+		slog.Info("Relay mode enabled - accepting external publishers")
 	}
 
 	return h.runServer(context.TODO())

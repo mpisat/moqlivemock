@@ -11,6 +11,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/Eyevinn/moqlivemock/internal"
@@ -28,6 +30,47 @@ const (
 	mediaPriority = 128
 )
 
+// relayedTrack represents a track from an external publisher
+type relayedTrack struct {
+	namespace []string
+	session   *moqtransport.Session
+}
+
+// trackRegistry stores tracks announced by external publishers
+type trackRegistry struct {
+	mu     sync.RWMutex
+	tracks map[string]*relayedTrack // key: namespace joined by "/"
+}
+
+func newTrackRegistry() *trackRegistry {
+	return &trackRegistry{
+		tracks: make(map[string]*relayedTrack),
+	}
+}
+
+func (r *trackRegistry) register(namespace []string, session *moqtransport.Session) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := strings.Join(namespace, "/")
+	r.tracks[key] = &relayedTrack{namespace: namespace, session: session}
+	slog.Info("Registered external publisher", "namespace", key)
+}
+
+func (r *trackRegistry) unregister(namespace []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := strings.Join(namespace, "/")
+	delete(r.tracks, key)
+	slog.Info("Unregistered external publisher", "namespace", key)
+}
+
+func (r *trackRegistry) get(namespace []string) *relayedTrack {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	key := strings.Join(namespace, "/")
+	return r.tracks[key]
+}
+
 type moqHandler struct {
 	addr            string
 	tlsConfig       *tls.Config
@@ -36,9 +79,16 @@ type moqHandler struct {
 	catalog         *internal.Catalog
 	logfh           io.Writer
 	fingerprintPort int
+	relayMode       bool
+	registry        *trackRegistry
 }
 
 func (h *moqHandler) runServer(ctx context.Context) error {
+	// Initialize track registry for relay mode
+	if h.relayMode {
+		h.registry = newTrackRegistry()
+	}
+
 	// Start HTTP server for fingerprint if port is specified
 	if h.fingerprintPort > 0 {
 		go h.startFingerprintServer()
@@ -193,10 +243,22 @@ func serveQUICConn(wt *webtransport.Server, conn *quic.Conn) {
 	}
 }
 
-func (h *moqHandler) getHandler() moqtransport.Handler {
+func (h *moqHandler) getHandler(session *moqtransport.Session) moqtransport.Handler {
 	return moqtransport.HandlerFunc(func(w moqtransport.ResponseWriter, r *moqtransport.Message) {
 		switch r.Method {
 		case moqtransport.MessageAnnounce:
+			if h.relayMode {
+				// Accept announcements from external publishers
+				err := w.Accept()
+				if err != nil {
+					slog.Error("failed to accept announcement", "error", err)
+					return
+				}
+				h.registry.register(r.Namespace, session)
+				slog.Info("Accepted external publisher announcement", "namespace", r.Namespace)
+				return
+			}
+			// Not in relay mode - reject announcements
 			slog.Warn("got unexpected announcement", "namespace", r.Namespace)
 			err := w.Reject(0, fmt.Sprintf("%s doesn't take announcements", appName))
 			if err != nil {
@@ -207,9 +269,20 @@ func (h *moqHandler) getHandler() moqtransport.Handler {
 	})
 }
 
-func (h *moqHandler) getSubscribeHandler() moqtransport.SubscribeHandler {
+func (h *moqHandler) getSubscribeHandler(session *moqtransport.Session) moqtransport.SubscribeHandler {
 	return moqtransport.SubscribeHandlerFunc(
 		func(w *moqtransport.SubscribeResponseWriter, m *moqtransport.SubscribeMessage) {
+			// In relay mode, check if this is for an external publisher
+			if h.relayMode && h.registry != nil {
+				if track := h.registry.get(m.Namespace); track != nil {
+					slog.Info("Forwarding subscription to external publisher",
+						"namespace", m.Namespace, "track", m.Track)
+					go h.relaySubscription(w, m, track)
+					return
+				}
+			}
+
+			// Handle local namespace subscriptions
 			if !tupleEqual(m.Namespace, h.namespace) {
 				slog.Warn("got unexpected subscription namespace",
 					"received", m.Namespace,
@@ -220,6 +293,8 @@ func (h *moqHandler) getSubscribeHandler() moqtransport.SubscribeHandler {
 				}
 				return
 			}
+
+			// Catalog request
 			if m.Track == "catalog" {
 				err := w.Accept()
 				if err != nil {
@@ -248,42 +323,96 @@ func (h *moqHandler) getSubscribeHandler() moqtransport.SubscribeHandler {
 				}
 				return
 			}
-			// Check for subtitle tracks first
-			if st := h.asset.GetSubtitleTrackByName(m.Track); st != nil {
-				err := w.Accept()
-				if err != nil {
-					slog.Error("failed to accept subscription", "error", err)
-					return
-				}
-				slog.Info("got subtitle subscription", "track", st.Name)
-				go publishSubtitleTrack(context.TODO(), w, st)
-				return
-			}
 
-			// Check for video/audio tracks
-			for _, track := range h.catalog.Tracks {
-				if m.Track == track.Name {
+			// Check for subtitle tracks first
+			if h.asset != nil {
+				if st := h.asset.GetSubtitleTrackByName(m.Track); st != nil {
 					err := w.Accept()
 					if err != nil {
 						slog.Error("failed to accept subscription", "error", err)
 						return
 					}
-					slog.Info("got subscription", "track", track.Name)
-					go publishTrack(context.TODO(), w, h.asset, track.Name)
+					slog.Info("got subtitle subscription", "track", st.Name)
+					go publishSubtitleTrack(context.TODO(), w, st)
 					return
 				}
 			}
+
+			// Check for video/audio tracks
+			if h.catalog != nil {
+				for _, track := range h.catalog.Tracks {
+					if m.Track == track.Name {
+						err := w.Accept()
+						if err != nil {
+							slog.Error("failed to accept subscription", "error", err)
+							return
+						}
+						slog.Info("got subscription", "track", track.Name)
+						go publishTrack(context.TODO(), w, h.asset, track.Name)
+						return
+					}
+				}
+			}
+
 			// If we get here, the track was not found
 			err := w.Reject(moqtransport.ErrorCodeSubscribeTrackDoesNotExist, "unknown track")
 			if err != nil {
 				slog.Error("failed to reject subscription", "error", err)
 			}
-			// TODO: Handle unsubscribe
-			// For nice switching, it should be possible to unsubscribe to one video track
-			// and subscribe to another, and the publisher should go on until the end
-			// of the current MoQ group, and start the new track on the next MoQ group.
-			// This is not currently implemented.
 		})
+}
+
+// relaySubscription forwards a subscription to an external publisher and relays data
+func (h *moqHandler) relaySubscription(w *moqtransport.SubscribeResponseWriter, m *moqtransport.SubscribeMessage, track *relayedTrack) {
+	// Subscribe to the external publisher
+	remoteTrack, err := track.session.Subscribe(context.Background(), m.Namespace, m.Track)
+	if err != nil {
+		slog.Error("failed to subscribe to external publisher", "error", err)
+		w.Reject(moqtransport.ErrorCodeSubscribeInternal, "failed to subscribe to publisher")
+		return
+	}
+
+	// Accept the subscriber's request
+	err = w.Accept()
+	if err != nil {
+		slog.Error("failed to accept subscription", "error", err)
+		return
+	}
+
+	slog.Info("Relaying track", "namespace", m.Namespace, "track", m.Track)
+
+	// Relay objects from publisher to subscriber
+	for {
+		obj, err := remoteTrack.ReadObject(context.Background())
+		if err != nil {
+			if err == io.EOF {
+				slog.Info("External publisher track ended", "namespace", m.Namespace, "track", m.Track)
+			} else {
+				slog.Error("Error reading from external publisher", "error", err)
+			}
+			return
+		}
+
+		// Open subgroup and write object to subscriber
+		sg, err := w.OpenSubgroup(obj.GroupID, obj.SubGroupID, mediaPriority)
+		if err != nil {
+			slog.Error("failed to open subgroup for relay", "error", err)
+			return
+		}
+
+		_, err = sg.WriteObject(obj.ObjectID, obj.Payload)
+		if err != nil {
+			slog.Error("failed to write relayed object", "error", err)
+			sg.Close()
+			return
+		}
+
+		err = sg.Close()
+		if err != nil {
+			slog.Error("failed to close subgroup", "error", err)
+			return
+		}
+	}
 }
 
 func publishTrack(ctx context.Context, publisher moqtransport.Publisher, asset *internal.Asset, trackName string) {
@@ -402,12 +531,15 @@ func writeSubtitleGroup(ctx context.Context, moq *internal.MoQGroup, groupNr uin
 }
 
 func (h *moqHandler) handle(conn moqtransport.Connection) {
+	// Create session first so handlers can capture it
 	session := &moqtransport.Session{
-		Handler:             h.getHandler(),
-		SubscribeHandler:    h.getSubscribeHandler(),
 		InitialMaxRequestID: 100,
 		Qlogger:             qlog.NewQLOGHandler(h.logfh, "MoQ QLOG", "MoQ QLOG", conn.Perspective().String(), moqt.Schema),
 	}
+	// Set handlers that capture the session
+	session.Handler = h.getHandler(session)
+	session.SubscribeHandler = h.getSubscribeHandler(session)
+
 	err := session.Run(conn)
 	if err != nil {
 		slog.Error("MoQ Session initialization failed", "error", err)
@@ -417,9 +549,13 @@ func (h *moqHandler) handle(conn moqtransport.Connection) {
 		}
 		return
 	}
-	if err := session.Announce(context.Background(), h.namespace); err != nil {
-		slog.Error("failed to announce namespace", "namespace", h.namespace, "error", err)
-		return
+
+	// Only announce our namespace if we have local assets to publish
+	if h.asset != nil {
+		if err := session.Announce(context.Background(), h.namespace); err != nil {
+			slog.Error("failed to announce namespace", "namespace", h.namespace, "error", err)
+			return
+		}
 	}
 }
 
