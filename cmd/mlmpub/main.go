@@ -119,25 +119,34 @@ func runServer(opts *options) error {
 			return err
 		}
 	}
-	asset, err := internal.LoadAsset(opts.asset, opts.audioSampleBatch, opts.videoSampleBatch)
-	if err != nil {
-		return err
-	}
-	slog.Info("loaded asset", "path", opts.asset, "audioSampleBatch", opts.audioSampleBatch,
-		"videoSampleBatch", opts.videoSampleBatch)
+	var asset *internal.Asset
+	var catalog *internal.Catalog
 
-	// Parse subtitle languages and add tracks
-	wvttLangs := parseLanguages(opts.subsWvttLangs)
-	stppLangs := parseLanguages(opts.subsStppLangs)
-	err = asset.AddSubtitleTracks(wvttLangs, stppLangs)
-	if err != nil {
-		return err
-	}
-	slog.Info("added subtitle tracks", "wvtt", wvttLangs, "stpp", stppLangs)
+	// Only load assets if not in relay-only mode (asset path provided and exists)
+	if opts.asset != "" && !opts.relay {
+		var err error
+		asset, err = internal.LoadAsset(opts.asset, opts.audioSampleBatch, opts.videoSampleBatch)
+		if err != nil {
+			return err
+		}
+		slog.Info("loaded asset", "path", opts.asset, "audioSampleBatch", opts.audioSampleBatch,
+			"videoSampleBatch", opts.videoSampleBatch)
 
-	catalog, err := asset.GenCMAFCatalogEntry(time.Now().UnixMilli())
-	if err != nil {
-		return err
+		// Parse subtitle languages and add tracks
+		wvttLangs := parseLanguages(opts.subsWvttLangs)
+		stppLangs := parseLanguages(opts.subsStppLangs)
+		err = asset.AddSubtitleTracks(wvttLangs, stppLangs)
+		if err != nil {
+			return err
+		}
+		slog.Info("added subtitle tracks", "wvtt", wvttLangs, "stpp", stppLangs)
+
+		catalog, err = asset.GenCMAFCatalogEntry(time.Now().UnixMilli())
+		if err != nil {
+			return err
+		}
+	} else if opts.relay {
+		slog.Info("Relay-only mode - no local assets loaded")
 	}
 
 	var logfh io.Writer
